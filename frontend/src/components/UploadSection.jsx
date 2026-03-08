@@ -12,6 +12,28 @@ export default function UploadSection({
   const [liveTranscript, setLiveTranscript] = useState('')
   const [error, setError] = useState('')
   const recognitionRef = useRef(null)
+  const silenceTimeoutRef = useRef(null)
+  const lastChunkRef = useRef('')
+
+  const MIN_CONFIDENCE = 0.7
+  const MIN_TRANSCRIPT_CHARS = 3
+  const SILENCE_RESET_MS = 1500
+
+  const normalizeTranscript = (text) => {
+    const tokens = text.split(/\s+/).filter(Boolean)
+    if (tokens.length === 0) return ''
+
+    const deduped = [tokens[0]]
+    for (let i = 1; i < tokens.length; i += 1) {
+      const current = tokens[i]
+      const prev = tokens[i - 1]
+      if (current.toLowerCase() !== prev.toLowerCase()) {
+        deduped.push(current)
+      }
+    }
+
+    return deduped.join(' ')
+  }
 
   useEffect(() => {
     const SpeechRecognition =
@@ -34,23 +56,74 @@ export default function UploadSection({
       let finalTranscript = ''
 
       for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript
-        if (event.results[i].isFinal) {
-          finalTranscript += transcript + ' '
+        const result = event.results[i]
+        const alternative = result[0]
+        const rawTranscript = (alternative.transcript || '').trim()
+        const confidence =
+          typeof alternative.confidence === 'number'
+            ? alternative.confidence
+            : 1
+
+        // eslint-disable-next-line no-console
+        console.debug('Speech result:', {
+          transcript: rawTranscript,
+          confidence,
+          isFinal: result.isFinal,
+        })
+
+        if (!rawTranscript) {
+          continue
+        }
+
+        const cleanedTranscript = rawTranscript.replace(/[\s.,!?]/g, '')
+        const isNoise = cleanedTranscript.length < MIN_TRANSCRIPT_CHARS
+
+        if (confidence < MIN_CONFIDENCE || isNoise) {
+          continue
+        }
+
+        if (result.isFinal) {
+          finalTranscript += `${rawTranscript} `
         } else {
-          interimTranscript += transcript
+          interimTranscript += `${rawTranscript} `
         }
       }
 
-      setLiveTranscript((prev) => {
-        const currentFinal = prev.split('\n').pop() || ''
-        return (
-          prev.replace(/\n[^\n]*$/, '') +
-          '\n' +
-          (currentFinal + finalTranscript).trim() +
-          interimTranscript
-        )
-      })
+      const trimmedFinal = finalTranscript.trim()
+      const trimmedInterim = interimTranscript.trim()
+
+      if (!trimmedFinal && !trimmedInterim) {
+        // Nothing passed the confidence/noise filters
+        return
+      }
+
+      const rawNextChunk = `${trimmedFinal} ${trimmedInterim}`.trim()
+      const normalizedNextChunk = normalizeTranscript(rawNextChunk)
+
+      // eslint-disable-next-line no-console
+      console.debug('Accepted speech chunk:', normalizedNextChunk)
+
+      if (!normalizedNextChunk || normalizedNextChunk === lastChunkRef.current) {
+        // Either no meaningful text, or it's just a repeat of the last chunk
+        return
+      }
+
+      lastChunkRef.current = normalizedNextChunk
+
+      setLiveTranscript((prev) =>
+        normalizeTranscript(`${prev} ${normalizedNextChunk}`.trim())
+      )
+
+      if (silenceTimeoutRef.current) {
+        clearTimeout(silenceTimeoutRef.current)
+      }
+
+      silenceTimeoutRef.current = setTimeout(() => {
+        setLiveTranscript((prev) => prev.trim())
+        if (recognitionRef.current) {
+          recognitionRef.current.stop()
+        }
+      }, SILENCE_RESET_MS)
     }
 
     recognition.onerror = (event) => {
@@ -67,9 +140,7 @@ export default function UploadSection({
     }
 
     recognition.onend = () => {
-      if (isRecording) {
-        recognition.start()
-      }
+      setIsRecording(false)
     }
 
     recognitionRef.current = recognition
@@ -78,12 +149,18 @@ export default function UploadSection({
       if (recognitionRef.current) {
         recognitionRef.current.stop()
       }
+      if (silenceTimeoutRef.current) {
+        clearTimeout(silenceTimeoutRef.current)
+      }
     }
-  }, [isRecording])
+  }, [])
 
   const handleStartRecording = () => {
     setError('')
     setLiveTranscript('')
+    if (silenceTimeoutRef.current) {
+      clearTimeout(silenceTimeoutRef.current)
+    }
     if (recognitionRef.current) {
       try {
         recognitionRef.current.start()
@@ -95,6 +172,9 @@ export default function UploadSection({
   }
 
   const handleStopRecording = () => {
+    if (silenceTimeoutRef.current) {
+      clearTimeout(silenceTimeoutRef.current)
+    }
     if (recognitionRef.current) {
       recognitionRef.current.stop()
       setIsRecording(false)
