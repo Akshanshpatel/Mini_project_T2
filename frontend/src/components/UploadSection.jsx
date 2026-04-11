@@ -1,6 +1,106 @@
 import { useState, useEffect, useRef } from 'react'
 import { processTranscript } from '../services/api'
 
+const STORAGE_TRANSCRIPT_KEY = 'patientAdvocate:liveTranscript'
+const STORAGE_KEEP_KEY = 'patientAdvocate:keepTranscriptOnStart'
+const STORAGE_SESSION_ID_KEY = 'patientAdvocate:sessionId'
+const STORAGE_SEGMENT_ANCHORS_KEY = 'patientAdvocate:segmentAnchors'
+
+/** New UUID for this visit (chunked AI will key requests by session). */
+function createVisitSessionId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `visit-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function readStoredSessionId() {
+  try {
+    return sessionStorage.getItem(STORAGE_SESSION_ID_KEY)
+  } catch {
+    return null
+  }
+}
+
+function writeStoredSessionId(id) {
+  try {
+    sessionStorage.setItem(STORAGE_SESSION_ID_KEY, id)
+  } catch {
+    // ignore
+  }
+}
+
+/** One id per tab visit; persisted so refresh keeps the same “appointment”. */
+function ensureStoredSessionId() {
+  const existing = readStoredSessionId()
+  if (existing) return existing
+  const id = createVisitSessionId()
+  writeStoredSessionId(id)
+  return id
+}
+
+function readStoredSegmentAnchors() {
+  try {
+    const raw = sessionStorage.getItem(STORAGE_SEGMENT_ANCHORS_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+function writeStoredSegmentAnchors(anchors) {
+  try {
+    if (!anchors.length) {
+      sessionStorage.removeItem(STORAGE_SEGMENT_ANCHORS_KEY)
+    } else {
+      sessionStorage.setItem(
+        STORAGE_SEGMENT_ANCHORS_KEY,
+        JSON.stringify(anchors)
+      )
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function readStoredTranscript() {
+  try {
+    return sessionStorage.getItem(STORAGE_TRANSCRIPT_KEY) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+function writeStoredTranscript(value) {
+  try {
+    if (value) {
+      sessionStorage.setItem(STORAGE_TRANSCRIPT_KEY, value)
+    } else {
+      sessionStorage.removeItem(STORAGE_TRANSCRIPT_KEY)
+    }
+  } catch {
+    // Quota, private mode, or disabled storage — ignore
+  }
+}
+
+function readStoredKeepTranscriptOnStart() {
+  try {
+    return sessionStorage.getItem(STORAGE_KEEP_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+function writeStoredKeepTranscriptOnStart(value) {
+  try {
+    sessionStorage.setItem(STORAGE_KEEP_KEY, value ? '1' : '0')
+  } catch {
+    // ignore
+  }
+}
+
 export default function UploadSection({
   loading,
   setLoading,
@@ -9,15 +109,29 @@ export default function UploadSection({
   setSummary,
 }) {
   const [isRecording, setIsRecording] = useState(false)
-  const [liveTranscript, setLiveTranscript] = useState('')
+  const [liveTranscript, setLiveTranscript] = useState(() =>
+    readStoredTranscript()
+  )
+  const [keepTranscriptOnStart, setKeepTranscriptOnStart] = useState(() =>
+    readStoredKeepTranscriptOnStart()
+  )
   const [error, setError] = useState('')
   const recognitionRef = useRef(null)
-  const silenceTimeoutRef = useRef(null)
-  const lastChunkRef = useRef('')
+  const sessionIdRef = useRef(ensureStoredSessionId())
+  const segmentAnchorsRef = useRef(readStoredSegmentAnchors())
+  /** User pressed Start and expects listening until Stop (drives auto-restart). */
+  const wantRecordingRef = useRef(false)
+  /**
+   * `recognition.stop()` / cleanup often raises `onerror` with `aborted` — not a user failure.
+   */
+  const suppressAbortErrorRef = useRef(false)
+  /** After a `network` error, ignore `onend` auto-restart until the user taps Start again. */
+  const speechServiceFailedRef = useRef(false)
+  /** Avoid spamming the same network toast when Chrome fires multiple errors quickly. */
+  const lastNetworkErrorUiAtRef = useRef(0)
 
   const MIN_CONFIDENCE = 0.7
   const MIN_TRANSCRIPT_CHARS = 3
-  const SILENCE_RESET_MS = 1500
 
   const normalizeTranscript = (text) => {
     const tokens = text.split(/\s+/).filter(Boolean)
@@ -36,6 +150,14 @@ export default function UploadSection({
   }
 
   useEffect(() => {
+    writeStoredTranscript(liveTranscript)
+  }, [liveTranscript])
+
+  useEffect(() => {
+    writeStoredKeepTranscriptOnStart(keepTranscriptOnStart)
+  }, [keepTranscriptOnStart])
+
+  useEffect(() => {
     const SpeechRecognition =
       window.SpeechRecognition || window.webkitSpeechRecognition
 
@@ -52,11 +174,14 @@ export default function UploadSection({
     recognition.lang = 'en-US'
 
     recognition.onresult = (event) => {
-      let interimTranscript = ''
-      let finalTranscript = ''
+      let finalBatch = ''
 
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i]
+        if (!result.isFinal) {
+          continue
+        }
+
         const alternative = result[0]
         const rawTranscript = (alternative.transcript || '').trim()
         const confidence =
@@ -65,10 +190,9 @@ export default function UploadSection({
             : 1
 
         // eslint-disable-next-line no-console
-        console.debug('Speech result:', {
+        console.debug('Speech result (final only):', {
           transcript: rawTranscript,
           confidence,
-          isFinal: result.isFinal,
         })
 
         if (!rawTranscript) {
@@ -82,101 +206,187 @@ export default function UploadSection({
           continue
         }
 
-        if (result.isFinal) {
-          finalTranscript += `${rawTranscript} `
-        } else {
-          interimTranscript += `${rawTranscript} `
-        }
+        finalBatch += `${rawTranscript} `
       }
 
-      const trimmedFinal = finalTranscript.trim()
-      const trimmedInterim = interimTranscript.trim()
-
-      if (!trimmedFinal && !trimmedInterim) {
-        // Nothing passed the confidence/noise filters
+      const piece = normalizeTranscript(finalBatch.trim())
+      if (!piece) {
         return
       }
-
-      const rawNextChunk = `${trimmedFinal} ${trimmedInterim}`.trim()
-      const normalizedNextChunk = normalizeTranscript(rawNextChunk)
 
       // eslint-disable-next-line no-console
-      console.debug('Accepted speech chunk:', normalizedNextChunk)
+      console.debug('Appending final transcript:', piece)
 
-      if (!normalizedNextChunk || normalizedNextChunk === lastChunkRef.current) {
-        // Either no meaningful text, or it's just a repeat of the last chunk
-        return
-      }
-
-      lastChunkRef.current = normalizedNextChunk
-
-      setLiveTranscript((prev) =>
-        normalizeTranscript(`${prev} ${normalizedNextChunk}`.trim())
-      )
-
-      if (silenceTimeoutRef.current) {
-        clearTimeout(silenceTimeoutRef.current)
-      }
-
-      silenceTimeoutRef.current = setTimeout(() => {
-        setLiveTranscript((prev) => prev.trim())
-        if (recognitionRef.current) {
-          recognitionRef.current.stop()
+      setLiveTranscript((prev) => {
+        const prevTrim = prev.trimEnd()
+        if (!prevTrim) {
+          return piece
         }
-      }, SILENCE_RESET_MS)
+        return normalizeTranscript(`${prevTrim} ${piece}`.trim())
+      })
     }
 
     recognition.onerror = (event) => {
+      const code = event.error
       // eslint-disable-next-line no-console
-      console.error('Speech recognition error:', event.error)
-      if (event.error === 'no-speech') {
-        setError('No speech detected. Please try again.')
-      } else if (event.error === 'not-allowed') {
+      console.error('Speech recognition error:', code)
+
+      if (code === 'aborted' && suppressAbortErrorRef.current) {
+        suppressAbortErrorRef.current = false
+        return
+      }
+
+      if (code === 'aborted' && !wantRecordingRef.current) {
+        return
+      }
+
+      if (code === 'no-speech' && wantRecordingRef.current) {
+        return
+      }
+
+      if (code === 'network') {
+        wantRecordingRef.current = false
+        speechServiceFailedRef.current = true
+        setIsRecording(false)
+
+        const now = Date.now()
+        if (now - lastNetworkErrorUiAtRef.current < 2500) {
+          return
+        }
+        lastNetworkErrorUiAtRef.current = now
+
+        if (typeof window !== 'undefined' && !window.isSecureContext) {
+          setError(
+            'Speech recognition needs a secure page. Use https:// or open the app as http://localhost. A plain http:// address with your Wi‑Fi IP is often blocked.'
+          )
+        } else if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+          setError('You appear to be offline. Reconnect, then tap Start again.')
+        } else {
+          setError(
+            'Could not reach the speech service (Chrome sends audio to Google). Try another network, turn off VPN or a strict firewall, or type your notes below.'
+          )
+        }
+        return
+      }
+
+      wantRecordingRef.current = false
+
+      if (code === 'no-speech') {
+        setError('No speech detected. Tap Start when you are ready to speak.')
+      } else if (code === 'not-allowed') {
         setError('Microphone access denied. Please allow microphone access.')
+      } else if (code === 'audio-capture') {
+        setError(
+          'No microphone found or it is in use. Check your device and try again.'
+        )
+      } else if (code === 'service-not-allowed') {
+        setError(
+          'Speech recognition is not available (blocked or unsupported in this context).'
+        )
       } else {
-        setError(`Speech recognition error: ${event.error}`)
+        setError(`Speech recognition error: ${code}`)
       }
       setIsRecording(false)
     }
 
     recognition.onend = () => {
+      if (speechServiceFailedRef.current) {
+        wantRecordingRef.current = false
+        setIsRecording(false)
+        return
+      }
+      if (wantRecordingRef.current && recognitionRef.current) {
+        try {
+          recognitionRef.current.start()
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error('Speech recognition restart failed:', err)
+          wantRecordingRef.current = false
+          setIsRecording(false)
+          setError('Listening stopped. Tap Start to record again.')
+        }
+        return
+      }
       setIsRecording(false)
     }
 
     recognitionRef.current = recognition
 
     return () => {
+      wantRecordingRef.current = false
+      suppressAbortErrorRef.current = true
       if (recognitionRef.current) {
-        recognitionRef.current.stop()
-      }
-      if (silenceTimeoutRef.current) {
-        clearTimeout(silenceTimeoutRef.current)
+        try {
+          recognitionRef.current.stop()
+        } catch {
+          // already stopped
+        }
       }
     }
   }, [])
 
   const handleStartRecording = () => {
     setError('')
-    setLiveTranscript('')
-    if (silenceTimeoutRef.current) {
-      clearTimeout(silenceTimeoutRef.current)
+    speechServiceFailedRef.current = false
+    lastNetworkErrorUiAtRef.current = 0
+
+    if (typeof window !== 'undefined' && !window.isSecureContext) {
+      setError(
+        'Speech recognition needs a secure page. Use https:// or http://localhost (opening via your PC’s LAN IP as http:// is often blocked).'
+      )
+      return
     }
+
+    const prefixAfterStart = keepTranscriptOnStart
+      ? (() => {
+          const t = liveTranscript.trimEnd()
+          return t ? `${t}\n\n` : ''
+        })()
+      : ''
+    const charOffset = prefixAfterStart.length
+
+    if (keepTranscriptOnStart) {
+      setLiveTranscript((prev) => {
+        const trimmed = prev.trimEnd()
+        if (!trimmed) return ''
+        return `${trimmed}\n\n`
+      })
+    } else {
+      setLiveTranscript('')
+    }
+
     if (recognitionRef.current) {
       try {
         recognitionRef.current.start()
+        wantRecordingRef.current = true
+        const prevAnchors = segmentAnchorsRef.current
+        const nextAnchors = [
+          ...prevAnchors,
+          {
+            segmentIndex: prevAnchors.length,
+            charOffset,
+            startedAt: Date.now(),
+          },
+        ]
+        segmentAnchorsRef.current = nextAnchors
+        writeStoredSegmentAnchors(nextAnchors)
         setIsRecording(true)
       } catch (err) {
+        wantRecordingRef.current = false
         setError('Failed to start recording. Please try again.')
       }
     }
   }
 
   const handleStopRecording = () => {
-    if (silenceTimeoutRef.current) {
-      clearTimeout(silenceTimeoutRef.current)
-    }
+    wantRecordingRef.current = false
     if (recognitionRef.current) {
-      recognitionRef.current.stop()
+      suppressAbortErrorRef.current = true
+      try {
+        recognitionRef.current.stop()
+      } catch {
+        // invalid state if already ended
+      }
       setIsRecording(false)
     }
   }
@@ -227,9 +437,35 @@ export default function UploadSection({
     )
   }
 
+  const handleClearTranscript = () => {
+    if (isRecording || loading) return
+    setError('')
+    setLiveTranscript('')
+    const nextId = createVisitSessionId()
+    sessionIdRef.current = nextId
+    writeStoredSessionId(nextId)
+    segmentAnchorsRef.current = []
+    writeStoredSegmentAnchors([])
+  }
+
   return (
     <section className="card">
       <h2 className="cardTitle">Record Audio</h2>
+
+      <div className="visitOptions">
+        <label className="checkboxLabel">
+          <input
+            type="checkbox"
+            checked={keepTranscriptOnStart}
+            onChange={(e) => setKeepTranscriptOnStart(e.target.checked)}
+            disabled={isRecording || loading}
+          />
+          <span>
+            Same visit — keep my transcript when I press Start (for breaks or
+            when the doctor steps out)
+          </span>
+        </label>
+      </div>
 
       <div className="recordingControls">
         <button
@@ -261,9 +497,19 @@ export default function UploadSection({
       </div>
 
       <div className="transcriptArea">
-        <label htmlFor="liveTranscript" className="transcriptLabel">
-          Live Transcript:
-        </label>
+        <div className="transcriptHeader">
+          <label htmlFor="liveTranscript" className="transcriptLabel">
+            Live Transcript:
+          </label>
+          <button
+            type="button"
+            className="textLinkBtn"
+            onClick={handleClearTranscript}
+            disabled={!liveTranscript.trim() || isRecording || loading}
+          >
+            Clear transcript
+          </button>
+        </div>
         <textarea
           id="liveTranscript"
           className="transcriptTextarea"
@@ -273,6 +519,10 @@ export default function UploadSection({
           rows={6}
           disabled={loading}
         />
+        <p className="mutedText saveHint">
+          Auto-saved in this browser tab if you refresh (cleared when you close
+          the tab).
+        </p>
       </div>
 
       {loading ? (
