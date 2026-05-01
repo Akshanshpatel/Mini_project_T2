@@ -1,6 +1,6 @@
 import axios from 'axios'
 
-const API_BASE_URL = 'http://localhost:5000'
+const API_BASE_URL = 'https://mini-project-t2-1.onrender.com/'
 
 export const processTranscript = async (transcript) => {
   if (!transcript || !transcript.trim()) {
