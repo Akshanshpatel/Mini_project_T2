@@ -12,30 +12,24 @@ async function processAppointment(req, res) {
 
     const cleanedTranscript = transcript.trim()
 
-    const { simplified, summary } =
-      await generateSummary(cleanedTranscript)
+    const result = await generateSummary(cleanedTranscript)
+
+    if (!result || typeof result !== 'object') {
+      throw new Error('Invalid response from AI service')
+    }
+
+    console.log('📦 CONTROLLER RECEIVED:', result)
 
     return res.status(200).json({
       transcript: cleanedTranscript,
-      simplified,
-      summary,
+      simplified: result.simplified,
+      summary: result.summary,
     })
   } catch (err) {
-    console.error('Error processing appointment:', err.message)
+    console.error('❌ PROCESS APPOINTMENT ERROR:', err)
 
-    // Prevent app crash during Gemini quota issues
-    return res.status(200).json({
-      transcript: req.body?.transcript || '',
-      simplified:
-        'AI summary temporarily unavailable.',
-      summary: {
-        diagnosis: '',
-        medications: '',
-        dosage: '',
-        tests: '',
-        advice: '',
-      },
-      error: err.message,
+    return res.status(500).json({
+      error: err.message || 'Something went wrong',
     })
   }
 }

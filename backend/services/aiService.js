@@ -1,31 +1,30 @@
 require('dotenv').config()
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY
+const Groq = require('groq-sdk')
 
-if (!GEMINI_API_KEY) {
-  throw new Error('Missing GEMINI_API_KEY in environment variables')
+const GROQ_API_KEY = process.env.GROQ_API_KEY
+
+if (!GROQ_API_KEY) {
+  throw new Error('Missing GROQ_API_KEY in environment variables')
 }
 
-// Stable default model
-const GEMINI_MODEL_ID =
-  process.env.GEMINI_MODEL?.trim() || 'gemini-2.0-flash'
+console.log(`🔑 GROQ API KEY LOADED: ${GROQ_API_KEY.slice(0, 4)}...${GROQ_API_KEY.slice(-4)}`)
 
-const GEMINI_GENERATE_URL =
-  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL_ID}:generateContent`
+const client = new Groq({
+  apiKey: GROQ_API_KEY,
+})
 
 function buildPrompt(transcript) {
-  const trimmed = (transcript || '').trim()
-
   return `
 Explain this medical conversation in very simple terms for a patient.
 
 Keep it short, clear, and easy to understand.
 
 """
-${trimmed}
+${transcript}
 """
 
-Return ONLY valid JSON.
+Return ONLY valid JSON in this format:
 
 {
   "simplified": "",
@@ -40,133 +39,92 @@ Return ONLY valid JSON.
 `
 }
 
-async function callGeminiGenerateContent(promptText) {
-  const response = await fetch(GEMINI_GENERATE_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-goog-api-key': GEMINI_API_KEY,
-    },
-    body: JSON.stringify({
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: promptText }],
-        },
-      ],
-      generationConfig: {
-        temperature: 0.3,
-        maxOutputTokens: 500,
-      },
-    }),
-  })
-
-  const raw = await response.text()
-
-  if (!response.ok) {
-    throw new Error(
-      `Gemini request failed (${response.status}): ${raw}`
-    )
-  }
-
-  let data
-
-  try {
-    data = JSON.parse(raw)
-  } catch {
-    throw new Error('Gemini response was not valid JSON')
-  }
-
-  const text = (data?.candidates?.[0]?.content?.parts || [])
-    .map((part) => part.text || '')
-    .join('')
-    .trim()
-
-  if (!text) {
-    throw new Error('Gemini returned empty response')
-  }
-
-  return text
-}
-
-function shouldRetry(error) {
-  const message = error.message || ''
-
-  // Don't retry client/auth errors
-  if (/400|401|403/.test(message)) {
-    return false
-  }
-
-  if (/API key|invalid|unauthorized|permission/i.test(message)) {
-    return false
-  }
-
-  return true
-}
-
-async function withRetry(fn, retries = 2, delayMs = 1000) {
-  let lastError
-
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      return await fn()
-    } catch (error) {
-      lastError = error
-
-      if (!shouldRetry(error) || attempt === retries) {
-        break
-      }
-
-      await new Promise((resolve) =>
-        setTimeout(resolve, delayMs * (attempt + 1))
-      )
-    }
-  }
-
-  throw lastError
-}
-
 async function generateSummary(transcript) {
   try {
+    console.log('🚀 GENERATING SUMMARY FOR TRANSCRIPT LENGTH:', transcript.length)
+    
     const prompt = buildPrompt(transcript)
 
-    const content = await withRetry(() =>
-      callGeminiGenerateContent(prompt)
-    )
+    const response = await client.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a medical assistant. Return ONLY valid JSON.',
+        },
+        {
+          role: 'user',
+          content: prompt,
+        },
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.1,
+      max_tokens: 1024,
+    })
 
-    const jsonMatch = content.match(/\{[\s\S]*\}/)
+    console.log('🔍 FULL GROQ RESPONSE:', JSON.stringify(response, null, 2))
 
-    const jsonContent = jsonMatch
-      ? jsonMatch[0]
-      : content
+    const text = response?.choices?.[0]?.message?.content
 
-    const parsed = JSON.parse(jsonContent)
+    if (!text) {
+      console.error('❌ GROQ RETURNED EMPTY CONTENT')
+      throw new Error('No content returned from Groq')
+    }
+
+    console.log('🧠 MODEL OUTPUT:', text)
+
+    let parsed
+    try {
+      parsed = JSON.parse(text)
+    } catch (parseError) {
+      console.warn('⚠️ JSON.parse failed on direct text, trying regex match...')
+      const jsonMatch = text.match(/\{[\s\S]*\}/)
+      if (!jsonMatch) {
+        throw new Error('Model did not return valid JSON:\n' + text)
+      }
+      parsed = JSON.parse(jsonMatch[0])
+    }
+
+    console.log('✅ FINAL PARSED OUTPUT:', parsed)
 
     return {
-      simplified: parsed.simplified || '',
-      summary: {
-        diagnosis: parsed.summary?.diagnosis || '',
-        medications: parsed.summary?.medications || '',
-        dosage: parsed.summary?.dosage || '',
-        tests: parsed.summary?.tests || '',
-        advice: parsed.summary?.advice || '',
-      },
+      simplified: parsed.simplified || parsed.simplifiedExplanation || 'Explanation unavailable.',
+      summary: parsed.summary || parsed.structuredSummary || { diagnosis: 'Unavailable' },
     }
   } catch (error) {
-    console.error('Gemini Error:', error.message)
+    console.error('❌ GROQ FAILURE:', error.message)
 
-    // Fallback response so app never crashes
-    return {
-      simplified:
-        'AI summary temporarily unavailable.',
-      summary: {
-        diagnosis: '',
-        medications: '',
-        dosage: '',
-        tests: '',
-        advice: '',
-      },
+    // Fallback to Gemini if Groq fails
+    if (process.env.GEMINI_API_KEY) {
+      console.log('🔄 FALLING BACK TO GEMINI...')
+      try {
+        const { GoogleGenerativeAI } = require('@google/generative-ai')
+        const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+        const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-2.0-flash' })
+
+        const prompt = buildPrompt(transcript)
+        const result = await model.generateContent(prompt)
+        const text = result.response.text()
+
+        console.log('🧠 GEMINI OUTPUT:', text)
+
+        const jsonMatch = text.match(/\{[\s\S]*\}/)
+        if (!jsonMatch) throw new Error('Gemini did not return valid JSON')
+        
+        const parsed = JSON.parse(jsonMatch[0])
+        return {
+          simplified: parsed.simplified || parsed.simplifiedExplanation || 'Explanation unavailable.',
+          summary: parsed.summary || parsed.structuredSummary || { diagnosis: 'Unavailable' },
+        }
+      } catch (geminiError) {
+        console.error('❌ GEMINI FALLBACK ALSO FAILED:', geminiError.message)
+      }
     }
+
+    if (error.status === 401 || error.message.includes('401')) {
+      throw new Error('Invalid Groq API Key. Please check your .env file or use Gemini.')
+    }
+    throw error
   }
 }
 
