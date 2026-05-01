@@ -1,13 +1,17 @@
 function normalizeSummary(summary) {
   if (!summary) return null
-  if (typeof summary === 'object') return summary
+
+  if (typeof summary === 'object') {
+    return summary
+  }
 
   if (typeof summary === 'string') {
     try {
-      const parsed = JSON.parse(summary)
-      if (parsed && typeof parsed === 'object') return parsed
+      return JSON.parse(summary)
     } catch {
-      return { diagnosis: summary }
+      return {
+        diagnosis: summary,
+      }
     }
   }
 
@@ -16,13 +20,18 @@ function normalizeSummary(summary) {
 
 function asList(value) {
   if (!value) return []
-  if (Array.isArray(value)) return value.filter(Boolean)
+
+  if (Array.isArray(value)) {
+    return value.filter(Boolean)
+  }
+
   if (typeof value === 'string') {
     return value
       .split(/\n|,/g)
-      .map((s) => s.trim())
+      .map((item) => item.trim())
       .filter(Boolean)
   }
+
   return [String(value)]
 }
 
@@ -35,56 +44,95 @@ function Field({ label, children }) {
   )
 }
 
-export default function ResultSection({ transcript, simplified, summary }) {
+export default function ResultSection({
+  transcript,
+  simplified,
+  summary,
+}) {
   const normalized = normalizeSummary(summary)
 
   const diagnosis =
-    normalized?.diagnosis ?? normalized?.Diagnosis ?? normalized?.dx ?? ''
+    normalized?.diagnosis ||
+    normalized?.Diagnosis ||
+    normalized?.dx ||
+    ''
+
   const medications =
-    normalized?.medications ?? normalized?.Medications ?? normalized?.rx ?? []
-  const dosage = normalized?.dosage ?? normalized?.Dosage ?? ''
-  const tests = normalized?.tests ?? normalized?.Tests ?? []
-  const advice = normalized?.advice ?? normalized?.Advice ?? ''
+    normalized?.medications ||
+    normalized?.Medications ||
+    normalized?.rx ||
+    []
+
+  const dosage =
+    normalized?.dosage ||
+    normalized?.Dosage ||
+    ''
+
+  const tests =
+    normalized?.tests ||
+    normalized?.Tests ||
+    []
+
+  const advice =
+    normalized?.advice ||
+    normalized?.Advice ||
+    ''
 
   const medicationItems = asList(medications)
   const testItems = asList(tests)
 
   return (
     <section className="resultsGrid">
+      {/* Transcript */}
       <div className="card">
         <h2 className="cardTitle">Transcript</h2>
+
         <div className="contentBox">
           {transcript ? (
             <pre className="preText">{transcript}</pre>
           ) : (
-            <p className="mutedText">No transcript yet.</p>
+            <p className="mutedText">
+              No transcript available.
+            </p>
           )}
         </div>
       </div>
 
+      {/* Simplified */}
       <div className="card">
-        <h2 className="cardTitle">Simplified Explanation</h2>
+        <h2 className="cardTitle">
+          Simplified Explanation
+        </h2>
+
         <div className="contentBox">
           {simplified ? (
             <pre className="preText">{simplified}</pre>
           ) : (
-            <p className="mutedText">No simplified explanation yet.</p>
+            <p className="mutedText">
+              No explanation available.
+            </p>
           )}
         </div>
       </div>
 
+      {/* Structured Summary */}
       <div className="card">
-        <h2 className="cardTitle">Structured Summary</h2>
+        <h2 className="cardTitle">
+          Structured Summary
+        </h2>
+
         <div className="contentBox">
           {normalized ? (
             <div className="fields">
-              <Field label="Diagnosis">{diagnosis || '—'}</Field>
+              <Field label="Diagnosis">
+                {diagnosis || '—'}
+              </Field>
 
               <Field label="Medications">
                 {medicationItems.length ? (
                   <ul className="list">
-                    {medicationItems.map((m, idx) => (
-                      <li key={`${m}-${idx}`}>{m}</li>
+                    {medicationItems.map((item, index) => (
+                      <li key={index}>{item}</li>
                     ))}
                   </ul>
                 ) : (
@@ -92,13 +140,15 @@ export default function ResultSection({ transcript, simplified, summary }) {
                 )}
               </Field>
 
-              <Field label="Dosage">{dosage || '—'}</Field>
+              <Field label="Dosage">
+                {dosage || '—'}
+              </Field>
 
               <Field label="Tests">
                 {testItems.length ? (
                   <ul className="list">
-                    {testItems.map((t, idx) => (
-                      <li key={`${t}-${idx}`}>{t}</li>
+                    {testItems.map((item, index) => (
+                      <li key={index}>{item}</li>
                     ))}
                   </ul>
                 ) : (
@@ -106,14 +156,17 @@ export default function ResultSection({ transcript, simplified, summary }) {
                 )}
               </Field>
 
-              <Field label="Advice">{advice || '—'}</Field>
+              <Field label="Advice">
+                {advice || '—'}
+              </Field>
             </div>
           ) : (
-            <p className="mutedText">No summary yet.</p>
+            <p className="mutedText">
+              No summary available.
+            </p>
           )}
         </div>
       </div>
     </section>
   )
 }
-

@@ -6,9 +6,9 @@ if (!GEMINI_API_KEY) {
   throw new Error('Missing GEMINI_API_KEY in environment variables')
 }
 
-// Use current supported Gemini model
+// Stable default model
 const GEMINI_MODEL_ID =
-  process.env.GEMINI_MODEL?.trim()
+  process.env.GEMINI_MODEL?.trim() || 'gemini-2.0-flash'
 
 const GEMINI_GENERATE_URL =
   `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL_ID}:generateContent`
@@ -18,6 +18,7 @@ function buildPrompt(transcript) {
 
   return `
 Explain this medical conversation in very simple terms for a patient.
+
 Keep it short, clear, and easy to understand.
 
 """
@@ -36,17 +37,11 @@ Return ONLY valid JSON.
     "advice": ""
   }
 }
-
-Rules:
-- Put simple explanation only inside "simplified"
-- Keep explanation short
-- Fill summary fields only if information is clearly available
-- Otherwise return empty strings
 `
 }
 
 async function callGeminiGenerateContent(promptText) {
-  const res = await fetch(GEMINI_GENERATE_URL, {
+  const response = await fetch(GEMINI_GENERATE_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -66,11 +61,11 @@ async function callGeminiGenerateContent(promptText) {
     }),
   })
 
-  const raw = await res.text()
+  const raw = await response.text()
 
-  if (!res.ok) {
+  if (!response.ok) {
     throw new Error(
-      `Gemini request failed (${res.status}): ${raw}`
+      `Gemini request failed (${response.status}): ${raw}`
     )
   }
 
@@ -83,7 +78,7 @@ async function callGeminiGenerateContent(promptText) {
   }
 
   const text = (data?.candidates?.[0]?.content?.parts || [])
-    .map((p) => p.text || '')
+    .map((part) => part.text || '')
     .join('')
     .trim()
 
@@ -94,15 +89,15 @@ async function callGeminiGenerateContent(promptText) {
   return text
 }
 
-function shouldRetry(err) {
-  const message = err.message || ''
+function shouldRetry(error) {
+  const message = error.message || ''
 
-  // Do NOT retry auth/config errors
+  // Don't retry client/auth errors
   if (/400|401|403/.test(message)) {
     return false
   }
 
-  if (/API key|permission|unauthorized|invalid/i.test(message)) {
+  if (/API key|invalid|unauthorized|permission/i.test(message)) {
     return false
   }
 
@@ -115,17 +110,15 @@ async function withRetry(fn, retries = 2, delayMs = 1000) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       return await fn()
-    } catch (err) {
-      lastError = err
+    } catch (error) {
+      lastError = error
 
-      if (!shouldRetry(err) || attempt === retries) {
+      if (!shouldRetry(error) || attempt === retries) {
         break
       }
 
-      const backoff = delayMs * (attempt + 1)
-
       await new Promise((resolve) =>
-        setTimeout(resolve, backoff)
+        setTimeout(resolve, delayMs * (attempt + 1))
       )
     }
   }
@@ -141,24 +134,13 @@ async function generateSummary(transcript) {
       callGeminiGenerateContent(prompt)
     )
 
-    let jsonContent = content
-
-    // Extract JSON safely
     const jsonMatch = content.match(/\{[\s\S]*\}/)
 
-    if (jsonMatch) {
-      jsonContent = jsonMatch[0]
-    }
+    const jsonContent = jsonMatch
+      ? jsonMatch[0]
+      : content
 
-    let parsed
-
-    try {
-      parsed = JSON.parse(jsonContent)
-    } catch (err) {
-      throw new Error(
-        `Gemini response was not valid JSON: ${err.message}`
-      )
-    }
+    const parsed = JSON.parse(jsonContent)
 
     return {
       simplified: parsed.simplified || '',
@@ -170,9 +152,21 @@ async function generateSummary(transcript) {
         advice: parsed.summary?.advice || '',
       },
     }
-  } catch (err) {
-    console.error('Error calling Gemini API:', err.message)
-    throw err
+  } catch (error) {
+    console.error('Gemini Error:', error.message)
+
+    // Fallback response so app never crashes
+    return {
+      simplified:
+        'AI summary temporarily unavailable.',
+      summary: {
+        diagnosis: '',
+        medications: '',
+        dosage: '',
+        tests: '',
+        advice: '',
+      },
+    }
   }
 }
 

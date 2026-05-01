@@ -1,29 +1,41 @@
 const { generateSummary } = require('../services/aiService')
 
 async function processAppointment(req, res) {
-  const { transcript } = req.body
-
-  if (!transcript || !transcript.trim()) {
-    return res.status(400).json({ error: 'Transcript is required.' })
-  }
-
   try {
-    const { simplified, summary } = await generateSummary(transcript.trim())
+    const { transcript } = req.body
 
-    return res.json({
-      transcript: transcript.trim(),
+    if (!transcript || !transcript.trim()) {
+      return res.status(400).json({
+        error: 'Transcript is required.',
+      })
+    }
+
+    const cleanedTranscript = transcript.trim()
+
+    const { simplified, summary } =
+      await generateSummary(cleanedTranscript)
+
+    return res.status(200).json({
+      transcript: cleanedTranscript,
       simplified,
       summary,
     })
   } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error('Error processing appointment:', err)
+    console.error('Error processing appointment:', err.message)
 
-    const status = err.statusCode || err.status || 500
-    const message = err.message || 'Failed to process transcript.'
-
-    return res.status(status).json({
-      error: message,
+    // Prevent app crash during Gemini quota issues
+    return res.status(200).json({
+      transcript: req.body?.transcript || '',
+      simplified:
+        'AI summary temporarily unavailable.',
+      summary: {
+        diagnosis: '',
+        medications: '',
+        dosage: '',
+        tests: '',
+        advice: '',
+      },
+      error: err.message,
     })
   }
 }
@@ -31,4 +43,3 @@ async function processAppointment(req, res) {
 module.exports = {
   processAppointment,
 }
-
